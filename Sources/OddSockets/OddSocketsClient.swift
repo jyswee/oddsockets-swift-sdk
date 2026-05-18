@@ -1,0 +1,590 @@
+import Foundation
+import Combine
+import SocketIO
+import Logging
+
+/// Main OddSockets client for real-time messaging.
+///
+/// This class provides the primary interface for connecting to OddSockets
+/// and managing channels. It follows modern Swift patterns with async/await,
+/// Combine publishers, and proper error handling.
+@MainActor
+public final class OddSocketsClient: ObservableObject {
+    
+    // MARK: - Published Properties
+    
+    /// The current connection state.
+    @Published public private(set) var connectionState: ConnectionState = .disconnected
+    
+    /// Whether the client is connected.
+    @Published public private(set) var isConnected: Bool = false
+    
+    /// The assigned worker information.
+    @Published public private(set) var workerInfo: (workerId: String?, workerUrl: String?) = (nil, nil)
+    
+    // MARK: - Private Properties
+    
+    private let config: OddSocketsConfig
+    private let logger: Logger
+    private let urlSession: URLSession
+    private var socket: SocketIOClient?
+    private var channels: [String: OddSocketsChannel] = [:]
+    private var eventHandlers: [EventType: [(Any?) async -> Void]] = [:]
+    private var reconnectAttempts: Int = 0
+    private var heartbeatTimer: Timer?
+    private var connectionTask: Task<Void, Never>?
+    
+    // Session stickiness properties
+    private let clientIdentifier: String
+    private var sessionInfo: [String: Any]?
+    
+    // MARK: - Subjects for Combine
+    
+    private let eventSubject = PassthroughSubject<(EventType, Any?), Never>()
+    private let messageSubject = PassthroughSubject<Message, Never>()
+    private let errorSubject = PassthroughSubject<OddSocketsError, Never>()
+    
+    // MARK: - Public Properties
+    
+    /// The user ID for this client.
+    public var userId: String {
+        return config.userId ?? "anonymous"
+    }
+    
+    /// Publisher for all events.
+    public var eventPublisher: AnyPublisher<(EventType, Any?), Never> {
+        return eventSubject.eraseToAnyPublisher()
+    }
+    
+    /// Publisher for messages.
+    public var messagePublisher: AnyPublisher<Message, Never> {
+        return messageSubject.eraseToAnyPublisher()
+    }
+    
+    /// Publisher for errors.
+    public var errorPublisher: AnyPublisher<OddSocketsError, Never> {
+        return errorSubject.eraseToAnyPublisher()
+    }
+    
+    // MARK: - Initialization
+    
+    /// Initializes a new OddSocketsClient.
+    /// - Parameters:
+    ///   - config: The configuration for the client
+    ///   - logger: Optional logger instance
+    ///   - urlSession: Optional URL session
+    /// - Throws: `OddSocketsError.invalidConfiguration` if configuration is invalid
+    public init(
+        config: OddSocketsConfig,
+        logger: Logger? = nil,
+        urlSession: URLSession = .shared
+    ) throws {
+        try config.validate()
+        
+        self.config = config
+        self.logger = logger ?? Logger(label: "com.oddsockets.client")
+        self.urlSession = urlSession
+        
+        // Generate user ID if not provided
+        if config.userId == nil {
+            let generatedUserId = "user_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())"
+            self.config = OddSocketsConfig(
+                apiKey: config.apiKey,
+                managerUrl: config.managerUrl,
+                userId: generatedUserId,
+                autoConnect: config.autoConnect,
+                reconnectAttempts: config.reconnectAttempts,
+                heartbeatInterval: config.heartbeatInterval,
+                timeout: config.timeout
+            )
+        }
+        
+        // Generate client identifier for session stickiness
+        self.clientIdentifier = self._generateClientIdentifier()
+        
+        logger?.info("OddSockets client initialized for user: \(userId)")
+        
+        // Auto-connect if requested
+        if config.autoConnect {
+            connectionTask = Task {
+                do {
+                    try await connect()
+                } catch {
+                    logger?.warning("Auto-connect failed: \(error)")
+                    await emitEvent(.error, data: error)
+                }
+            }
+        }
+    }
+    
+    deinit {
+        connectionTask?.cancel()
+        heartbeatTimer?.invalidate()
+        Task {
+            await disconnect()
+        }
+    }
+    
+    // MARK: - Connection Management
+    
+    /// Connects to the OddSockets platform.
+    /// - Throws: `OddSocketsError` if connection fails
+    public func connect() async throws {
+        guard connectionState != .connected else {
+            logger.debug("Already connected")
+            return
+        }
+        
+        guard connectionState != .connecting else {
+            logger.debug("Connection already in progress")
+            return
+        }
+        
+        connectionState = .connecting
+        isConnected = false
+        await emitEvent(.connected, data: ["userId": userId, "timestamp": Date()])
+        
+        logger.info("Connecting to OddSockets...")
+        
+        do {
+            // Step 1: Get worker assignment from manager
+            try await getWorkerAssignment()
+            
+            // Step 2: Connect to assigned worker
+            try await connectToWorker()
+            
+            connectionState = .connected
+            isConnected = true
+            reconnectAttempts = 0
+            
+            // Start heartbeat
+            startHeartbeat()
+            
+            logger.info("Successfully connected to OddSockets")
+            await emitEvent(.connected, data: ["userId": userId, "timestamp": Date()])
+            
+        } catch {
+            connectionState = .failed
+            isConnected = false
+            logger.error("Connection failed: \(error)")
+            
+            let oddSocketsError = OddSocketsError.from(error)
+            await emitEvent(.error, data: oddSocketsError)
+            
+            // Schedule reconnection if attempts remain
+            if reconnectAttempts < config.reconnectAttempts {
+                await scheduleReconnect()
+            } else {
+                await emitEvent(.maxReconnectAttemptsReached, data: ["attempts": reconnectAttempts])
+            }
+            
+            throw oddSocketsError
+        }
+    }
+    
+    /// Disconnects from the OddSockets platform.
+    public func disconnect() async {
+        guard connectionState != .disconnected else {
+            logger.debug("Already disconnected")
+            return
+        }
+        
+        logger.info("Disconnecting from OddSockets...")
+        
+        // Stop heartbeat
+        stopHeartbeat()
+        
+        // Unsubscribe from all channels
+        for channel in channels.values {
+            await channel.unsubscribe()
+        }
+        
+        // Close socket connection
+        socket?.disconnect()
+        socket = nil
+        
+        connectionState = .disconnected
+        isConnected = false
+        workerInfo = (nil, nil)
+        
+        logger.info("Disconnected from OddSockets")
+        await emitEvent(.disconnected, data: ["userId": userId, "timestamp": Date()])
+    }
+    
+    // MARK: - Channel Management
+    
+    /// Gets or creates a channel.
+    /// - Parameter channelName: The channel name
+    /// - Returns: A channel instance
+    /// - Throws: `OddSocketsError.invalidChannelName` if channel name is invalid
+    public func channel(_ channelName: String) throws -> OddSocketsChannel {
+        guard !channelName.isEmpty else {
+            throw OddSocketsError.invalidChannelName(channelName)
+        }
+        
+        if let existingChannel = channels[channelName] {
+            return existingChannel
+        }
+        
+        let newChannel = OddSocketsChannel(name: channelName, client: self, logger: logger)
+        channels[channelName] = newChannel
+        return newChannel
+    }
+    
+    // MARK: - Bulk Publishing
+    
+    /// Publishes multiple messages at once.
+    /// - Parameter messages: The messages to publish
+    /// - Returns: Results for each message
+    /// - Throws: `OddSocketsError.connectionError` if not connected
+    public func publishBulk(_ messages: [BulkMessage]) async throws -> [BulkResult] {
+        guard isConnected else {
+            throw OddSocketsError.connectionFailed("Not connected to OddSockets")
+        }
+        
+        var results: [BulkResult] = []
+        
+        for bulkMessage in messages {
+            do {
+                guard !bulkMessage.channel.isEmpty else {
+                    results.append(BulkResult(success: false, error: "Missing channel name"))
+                    continue
+                }
+                
+                let channel = try self.channel(bulkMessage.channel)
+                let result = try await channel.publish(bulkMessage.message, options: bulkMessage.options)
+                results.append(BulkResult(success: true, result: result))
+                
+            } catch {
+                results.append(BulkResult(success: false, error: error.localizedDescription))
+            }
+        }
+        
+        return results
+    }
+    
+    // MARK: - Event Handling
+    
+    /// Adds an event handler.
+    /// - Parameters:
+    ///   - eventType: The event type
+    ///   - handler: The event handler
+    public func on(_ eventType: EventType, handler: @escaping AsyncEventHandler) {
+        if eventHandlers[eventType] == nil {
+            eventHandlers[eventType] = []
+        }
+        eventHandlers[eventType]?.append(handler)
+        logger.debug("Added event handler for \(eventType)")
+    }
+    
+    /// Adds a synchronous event handler.
+    /// - Parameters:
+    ///   - eventType: The event type
+    ///   - handler: The event handler
+    public func on(_ eventType: EventType, handler: @escaping EventHandler) {
+        on(eventType) { data in
+            handler(data)
+        }
+    }
+    
+    /// Removes event handlers.
+    /// - Parameter eventType: The event type
+    public func off(_ eventType: EventType) {
+        eventHandlers.removeValue(forKey: eventType)
+        logger.debug("Removed all handlers for \(eventType)")
+    }
+    
+    // MARK: - Internal Methods
+    
+    internal func getSocket() -> SocketIOClient? {
+        return socket
+    }
+    
+    internal func emitEvent(_ eventType: EventType, data: Any?) async {
+        // Emit to Combine publishers
+        eventSubject.send((eventType, data))
+        
+        if let message = data as? Message {
+            messageSubject.send(message)
+        }
+        
+        if let error = data as? OddSocketsError {
+            errorSubject.send(error)
+        }
+        
+        // Emit to registered handlers
+        if let handlers = eventHandlers[eventType] {
+            for handler in handlers {
+                await handler(data)
+            }
+        }
+    }
+    
+    // MARK: - Private Methods
+    
+    private func getWorkerAssignment() async throws {
+        // Discover the optimal manager URL automatically
+        let managerUrl = await ManagerDiscovery.shared.discoverManagerUrl(apiKey: config.apiKey)
+        
+        var urlComponents = URLComponents(string: "\(managerUrl)/api/cluster/select-worker")!
+        urlComponents.queryItems = [
+            URLQueryItem(name: "apiKey", value: config.apiKey),
+            URLQueryItem(name: "userId", value: userId),
+            URLQueryItem(name: "clientIdentifier", value: clientIdentifier)
+        ]
+        
+        var request = URLRequest(url: urlComponents.url!)
+        request.httpMethod = "GET"
+        request.setValue(config.apiKey, forHTTPHeaderField: "X-API-Key")
+        request.setValue("OddSockets-Swift-SDK/0.1.0-beta.1", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = config.timeout
+        
+        let (data, response) = try await urlSession.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OddSocketsError.networkError("Invalid response type")
+        }
+        
+        guard httpResponse.statusCode == 200 else {
+            throw OddSocketsError.connectionError("Worker assignment failed with status \(httpResponse.statusCode)")
+        }
+        
+        let assignment = try JSONDecoder().decode(WorkerAssignment.self, from: data)
+        
+        guard let workerUrl = assignment.url else {
+            throw OddSocketsError.workerAssignmentFailed("Invalid worker assignment response")
+        }
+        
+        workerInfo = (assignment.workerId, workerUrl)
+        
+        await emitEvent(.workerAssigned, data: [
+            "workerId": assignment.workerId as Any,
+            "workerUrl": workerUrl,
+            "session": assignment.session as Any
+        ])
+    }
+    
+    private func connectToWorker() async throws {
+        guard let workerUrl = workerInfo.workerUrl else {
+            throw OddSocketsError.workerAssignmentFailed("No worker URL available")
+        }
+        
+        guard let url = URL(string: workerUrl) else {
+            throw OddSocketsError.workerAssignmentFailed("Invalid worker URL")
+        }
+        
+        let manager = SocketManager(socketURL: url, config: [
+            .log(false),
+            .compress(true),
+            .connectParams(["apiKey": config.apiKey, "userId": userId]),
+            .forceWebsockets(true)
+        ])
+        
+        socket = manager.defaultSocket
+        
+        setupSocketEventHandlers()
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            var resumed = false
+            
+            socket?.on(clientEvent: .connect) { _, _ in
+                if !resumed {
+                    resumed = true
+                    continuation.resume()
+                }
+            }
+            
+            socket?.on(clientEvent: .error) { data, _ in
+                if !resumed {
+                    resumed = true
+                    let error = OddSocketsError.connectionError("Failed to connect to worker: \(data)")
+                    continuation.resume(throwing: error)
+                }
+            }
+            
+            socket?.connect(timeoutAfter: config.timeout) {
+                if !resumed {
+                    resumed = true
+                    continuation.resume(throwing: OddSocketsError.operationTimeout("Connection"))
+                }
+            }
+        }
+    }
+    
+    private func setupSocketEventHandlers() {
+        guard let socket = socket else { return }
+        
+        socket.on(clientEvent: .disconnect) { [weak self] data, _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                self.connectionState = .disconnected
+                self.isConnected = false
+                await self.emitEvent(.disconnected, data: data.first)
+                
+                // Auto-reconnect unless manually disconnected
+                if let reason = data.first as? String, reason != "io client disconnect" {
+                    await self.scheduleReconnect()
+                }
+            }
+        }
+        
+        socket.on(clientEvent: .error) { [weak self] data, _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                let error = OddSocketsError.connectionError("Socket error: \(data)")
+                await self.emitEvent(.error, data: error)
+            }
+        }
+        
+        // Forward channel-related events to appropriate channels
+        socket.on("message") { [weak self] data, _ in
+            Task { @MainActor in
+                await self?.handleChannelEvent("message", data: data)
+            }
+        }
+        
+        socket.on("subscribed") { [weak self] data, _ in
+            Task { @MainActor in
+                await self?.handleChannelEvent("subscribed", data: data)
+            }
+        }
+        
+        socket.on("unsubscribed") { [weak self] data, _ in
+            Task { @MainActor in
+                await self?.handleChannelEvent("unsubscribed", data: data)
+            }
+        }
+        
+        socket.on("published") { [weak self] data, _ in
+            Task { @MainActor in
+                await self?.handleChannelEvent("published", data: data)
+            }
+        }
+        
+        socket.on("presence") { [weak self] data, _ in
+            Task { @MainActor in
+                await self?.handleChannelEvent("presence", data: data)
+            }
+        }
+        
+        socket.on("presence_change") { [weak self] data, _ in
+            Task { @MainActor in
+                await self?.handleChannelEvent("presence_change", data: data)
+            }
+        }
+        
+        socket.on("history") { [weak self] data, _ in
+            Task { @MainActor in
+                await self?.handleChannelEvent("history", data: data)
+            }
+        }
+    }
+    
+    private func handleChannelEvent(_ eventName: String, data: [Any]) async {
+        guard let firstData = data.first,
+              let jsonData = try? JSONSerialization.data(withJSONObject: firstData),
+              let eventData = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let channelName = eventData["channel"] as? String,
+              let channel = channels[channelName] else {
+            return
+        }
+        
+        await channel.handleSocketEvent(eventName, data: eventData)
+    }
+    
+    private func scheduleReconnect() async {
+        guard connectionState != .connected else { return }
+        
+        connectionState = .reconnecting
+        reconnectAttempts += 1
+        
+        let delay = min(1000 * pow(2.0, Double(reconnectAttempts - 1)), 30000) / 1000.0
+        
+        await emitEvent(.reconnected, data: [
+            "attempt": reconnectAttempts,
+            "maxAttempts": config.reconnectAttempts,
+            "delay": delay
+        ])
+        
+        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        
+        if connectionState == .reconnecting {
+            do {
+                try await connect()
+            } catch {
+                logger.warning("Reconnection attempt \(reconnectAttempts) failed: \(error)")
+            }
+        }
+    }
+    
+    private func startHeartbeat() {
+        guard config.heartbeatInterval > 0 else { return }
+        
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: config.heartbeatInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                await self?.sendHeartbeat()
+            }
+        }
+    }
+    
+    private func stopHeartbeat() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+    }
+    
+    private func sendHeartbeat() async {
+        guard socket?.status == .connected else { return }
+        
+        logger.debug("Sending heartbeat")
+        socket?.emit("ping", ["timestamp": Date().timeIntervalSince1970])
+    }
+    
+    // MARK: - Client Identifier Generation
+    
+    /// Generate consistent client identifier for session stickiness
+    private func _generateClientIdentifier() -> String {
+        // Create a consistent identifier based on API key and user ID
+        let baseId = userId
+        let apiKeyHash = _hashString(config.apiKey)
+        return "\(apiKeyHash)_\(baseId)"
+    }
+    
+    /// Simple hash function for API key
+    private func _hashString(_ str: String) -> String {
+        var hash: Int = 0
+        if str.isEmpty { return String(hash) }
+        
+        for char in str {
+            let charValue = Int(char.asciiValue ?? 0)
+            hash = ((hash << 5) &- hash) &+ charValue
+            hash = hash & hash // Convert to 32-bit integer
+        }
+        
+        return String(abs(hash), radix: 36)
+    }
+    
+    // MARK: - Public Accessors
+    
+    /// Get client identifier used for session stickiness
+    public func getClientIdentifier() -> String {
+        return clientIdentifier
+    }
+    
+    /// Get session information
+    public func getSessionInfo() -> [String: Any]? {
+        return sessionInfo
+    }
+}
+
+// MARK: - Convenience Extensions
+
+extension OddSocketsClient {
+    /// Creates a client with default configuration.
+    /// - Parameter apiKey: Your OddSockets API key
+    /// - Returns: A configured OddSocketsClient instance
+    /// - Throws: `OddSocketsError.invalidConfiguration` if configuration is invalid
+    public static func `default`(apiKey: String) throws -> OddSocketsClient {
+        let config = OddSocketsConfig.default(apiKey: apiKey)
+        return try OddSocketsClient(config: config)
+    }
+}
