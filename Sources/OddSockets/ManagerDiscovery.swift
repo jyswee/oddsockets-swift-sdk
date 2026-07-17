@@ -8,7 +8,7 @@ internal class ManagerDiscovery {
     
     // MARK: - Properties
     
-    private let managerUrl = "https://manager1.oddsockets.tyga.network"
+    private let managerUrl = "https://connect.oddsockets.tyga.network"
     
     // MARK: - Singleton
     

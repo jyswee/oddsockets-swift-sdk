@@ -5,7 +5,7 @@ public struct OddSocketsConfig {
     /// The OddSockets API key (required).
     public let apiKey: String
     
-    /// The manager URL (optional, defaults to https://manager1.oddsockets.tyga.network).
+    /// The manager URL (optional, defaults to https://connect.oddsockets.tyga.network).
     public let managerUrl: String
     
     /// The user identifier (optional, auto-generated if not provided).
@@ -34,7 +34,7 @@ public struct OddSocketsConfig {
     ///   - timeout: Request timeout in seconds
     public init(
         apiKey: String,
-        managerUrl: String = "https://manager1.oddsockets.tyga.network",
+        managerUrl: String = "https://connect.oddsockets.tyga.network",
         userId: String? = nil,
         autoConnect: Bool = true,
         reconnectAttempts: Int = 5,
@@ -86,7 +86,7 @@ public struct OddSocketsConfig {
 /// Builder class for creating OddSocketsConfig instances using a fluent interface.
 public class OddSocketsConfigBuilder {
     private var apiKey: String = ""
-    private var managerUrl: String = "https://manager1.oddsockets.tyga.network"
+    private var managerUrl: String = "https://connect.oddsockets.tyga.network"
     private var userId: String?
     private var autoConnect: Bool = true
     private var reconnectAttempts: Int = 5

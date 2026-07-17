@@ -293,7 +293,7 @@ class AdvancedExample {
             let config = try OddSocketsConfigBuilder()
                 .apiKey("ak_your_api_key_here")
                 .userId("advanced_user")
-                .managerUrl("https://manager1.oddsockets.tyga.network")
+                .managerUrl("https://connect.oddsockets.tyga.network")
                 .timeout(15)
                 .heartbeatInterval(20)
                 .reconnectAttempts(3)

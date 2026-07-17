@@ -83,7 +83,7 @@ extension OddSocketsConfigBuilder {
     @discardableResult
     public func production() -> OddSocketsConfigBuilder {
         return self
-            .managerUrl("https://manager1.oddsockets.tyga.network")
+            .managerUrl("https://connect.oddsockets.tyga.network")
             .timeout(10)
             .heartbeatInterval(30)
     }
