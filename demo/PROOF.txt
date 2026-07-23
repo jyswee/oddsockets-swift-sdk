@@ -1,0 +1,47 @@
+warning: 'starscream': found 1 file(s) which are unhandled; explicitly declare them as resources or exclude from the target
+    /Users/joewee/Local_Gitea/oddsockets-swift-sdk/demo/.build/checkouts/Starscream/Sources/Info.plist
+[0/1] Planning build
+Building for debugging...
+[0/3] Write swift-version--58304C5D6DBC2206.txt
+Build of product 'OddSocketsDemo' complete! (0.31s)
+[connect] alice -> w002-oddsockets-1, bob -> w002-oddsockets-1
+
+=== Scenario 1: core pub/sub on demo-core-5c0668e14434674e ===
+[alice] subscribed
+[bob] subscribed
+[bob] published messageId=msg_c3807ec42e644f8aa74596a313c1a779
+[alice recv] Optional({username: "bob", text: "hello from bob marker=5c0668e14434674e", messageType: "demo"})
+[PASS] alice received bob's message across separate connections
+
+=== Scenario 2: enhanced events on demo-enh-5c0668e14434674e ===
+[alice/bob] subscribed to enhanced channel
+[bob] published anchor messageId=msg_ab9c0e725fc344038f96655e3b6c2fa4
+[bob] enhanced.startTyping fired
+[bob] enhanced.addReaction fired
+[alice on user_typing] {
+    channel = "demo-enh-5c0668e14434674e";
+    timestamp = "2026-07-23T17:23:15.380Z";
+    userId = bob;
+}
+[alice on reaction_added] {
+    channel = "demo-enh-5c0668e14434674e";
+    emoji = ":thumbsup:";
+    messageId = "msg_ab9c0e725fc344038f96655e3b6c2fa4";
+    reactionCounts =     (
+                {
+            "_id" = ":thumbsup:";
+            count = 1;
+            users =             (
+                                {
+                    userId = bob;
+                    userName = Bob;
+                }
+            );
+        }
+    );
+    userId = bob;
+    userName = Bob;
+}
+[PASS] alice received user_typing AND reaction_added from bob
+
+OK - all scenarios verified live through the OddSockets platform

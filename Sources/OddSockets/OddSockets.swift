@@ -25,6 +25,7 @@ public typealias OddSockets = OddSocketsClient
 /// - Parameter apiKey: Your OddSockets API key
 /// - Returns: A configured OddSocketsClient instance
 /// - Throws: `OddSocketsError.invalidConfiguration` if the API key is invalid
+@MainActor
 public func createClient(apiKey: String) throws -> OddSocketsClient {
     return try OddSocketsClient.default(apiKey: apiKey)
 }
@@ -33,6 +34,7 @@ public func createClient(apiKey: String) throws -> OddSocketsClient {
 /// - Parameter config: The configuration to use
 /// - Returns: A configured OddSocketsClient instance
 /// - Throws: `OddSocketsError.invalidConfiguration` if the configuration is invalid
+@MainActor
 public func createClient(config: OddSocketsConfig) throws -> OddSocketsClient {
     return try OddSocketsClient(config: config)
 }

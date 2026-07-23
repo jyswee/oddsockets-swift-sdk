@@ -49,7 +49,7 @@ public enum EventType: String, CaseIterable, Codable {
 public struct AnyCodable: Codable, Equatable {
     public let value: Any
     
-    public init<T: Codable>(_ value: T) {
+    public init(_ value: Any) {
         self.value = value
     }
     
@@ -204,11 +204,11 @@ extension AnyCodable {
 internal struct WorkerAssignment: Codable {
     let url: String?
     let workerId: String?
-    let session: String?
-    
+    let session: AnyCodable?
+
     private enum CodingKeys: String, CodingKey {
         case url
-        case workerId = "worker_id"
+        case workerId
         case session
     }
 }

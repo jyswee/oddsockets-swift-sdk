@@ -27,9 +27,20 @@ public final class OddSocketsClient: ObservableObject {
     private let config: OddSocketsConfig
     private let logger: Logger
     private let urlSession: URLSession
+    private var socketManager: SocketManager?
     private var socket: SocketIOClient?
+    /// Dedicated queue Socket.IO callbacks are delivered on. Keeping socket I/O
+    /// off the main queue prevents the MainActor executor from being starved in
+    /// async command-line / server contexts.
+    private let socketQueue = DispatchQueue(label: "com.oddsockets.socket", qos: .userInitiated)
     private var channels: [String: OddSocketsChannel] = [:]
     private var eventHandlers: [EventType: [(Any?) async -> Void]] = [:]
+    /// Persistent raw event listeners keyed by wire event name. This is the
+    /// public surface enhanced broadcasts (user_typing, reaction_added, ...) are
+    /// delivered on, fed directly by the real Socket.IO transport.
+    private var rawHandlers: [String: [(Any) -> Void]] = [:]
+    /// One-shot raw event listeners (enhanced request/response) keyed by event name.
+    private var rawOnceHandlers: [String: [(Any) -> Void]] = [:]
     private var reconnectAttempts: Int = 0
     private var heartbeatTimer: Timer?
     private var connectionTask: Task<Void, Never>?
@@ -80,15 +91,13 @@ public final class OddSocketsClient: ObservableObject {
         urlSession: URLSession = .shared
     ) throws {
         try config.validate()
-        
-        self.config = config
-        self.logger = logger ?? Logger(label: "com.oddsockets.client")
-        self.urlSession = urlSession
-        
-        // Generate user ID if not provided
+
+        // Generate user ID if not provided, resolving the final config once so
+        // the immutable stored property is initialized a single time.
+        var resolvedConfig = config
         if config.userId == nil {
             let generatedUserId = "user_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())"
-            self.config = OddSocketsConfig(
+            resolvedConfig = OddSocketsConfig(
                 apiKey: config.apiKey,
                 managerUrl: config.managerUrl,
                 userId: generatedUserId,
@@ -98,11 +107,17 @@ public final class OddSocketsClient: ObservableObject {
                 timeout: config.timeout
             )
         }
-        
-        // Generate client identifier for session stickiness
-        self.clientIdentifier = self._generateClientIdentifier()
-        
-        logger?.info("OddSockets client initialized for user: \(userId)")
+
+        self.config = resolvedConfig
+        self.logger = logger ?? Logger(label: "com.oddsockets.client")
+        self.urlSession = urlSession
+
+        // Generate client identifier for session stickiness. Computed from
+        // static helpers so no instance method is called before init completes.
+        let resolvedUserId = resolvedConfig.userId ?? "anonymous"
+        self.clientIdentifier = "\(Self._hashString(resolvedConfig.apiKey))_\(resolvedUserId)"
+
+        logger?.info("OddSockets client initialized for user: \(resolvedUserId)")
         
         // Auto-connect if requested
         if config.autoConnect {
@@ -118,11 +133,14 @@ public final class OddSocketsClient: ObservableObject {
     }
     
     deinit {
+        // Synchronous teardown only. Spawning a Task here would capture self
+        // and outlive deinit, leaving a dangling reference that traps at
+        // runtime ("deallocated with non-zero retain count"). The socket can
+        // be closed directly without touching async, actor-isolated state.
         connectionTask?.cancel()
         heartbeatTimer?.invalidate()
-        Task {
-            await disconnect()
-        }
+        socket?.disconnect()
+        socketManager?.disconnect()
     }
     
     // MARK: - Connection Management
@@ -282,9 +300,11 @@ public final class OddSocketsClient: ObservableObject {
     ///   - eventType: The event type
     ///   - handler: The event handler
     public func on(_ eventType: EventType, handler: @escaping EventHandler) {
-        on(eventType) { data in
-            handler(data)
-        }
+        // Type the wrapper explicitly so overload resolution routes to the
+        // AsyncEventHandler variant above, not back into this method (which
+        // would recurse infinitely).
+        let asyncHandler: AsyncEventHandler = { data in handler(data) }
+        on(eventType, handler: asyncHandler)
     }
     
     /// Removes event handlers.
@@ -293,7 +313,66 @@ public final class OddSocketsClient: ObservableObject {
         eventHandlers.removeValue(forKey: eventType)
         logger.debug("Removed all handlers for \(eventType)")
     }
-    
+
+    // MARK: - Raw Event Surface (enhanced features)
+
+    /// Emits a raw Socket.IO event to the worker.
+    ///
+    /// This is the send half of the enhanced (Slack-like) surface: the payload
+    /// travels over the same live socket as core pub/sub, with no simulation.
+    /// - Parameters:
+    ///   - event: The wire event name (e.g. `start_typing`, `add_reaction`).
+    ///   - data: The event payload.
+    public func emit(_ event: String, data: [String: Any]) {
+        guard let socket = socket, socket.status == .connected else {
+            logger.warning("Cannot emit '\(event)': socket not connected")
+            return
+        }
+        socket.emit(event, data)
+    }
+
+    /// Registers a persistent listener for a raw wire event.
+    ///
+    /// Enhanced broadcasts (`user_typing`, `reaction_added`, ...) are delivered
+    /// here as they arrive from the worker.
+    /// - Parameters:
+    ///   - event: The wire event name.
+    ///   - handler: Invoked with the decoded payload for every occurrence.
+    public func on(_ event: String, handler: @escaping (Any) -> Void) {
+        rawHandlers[event, default: []].append(handler)
+    }
+
+    /// Registers a one-shot listener for the next occurrence of a raw wire event.
+    /// - Parameters:
+    ///   - event: The wire event name.
+    ///   - handler: Invoked once with the decoded payload, then removed.
+    public func once(_ event: String, handler: @escaping (Any) -> Void) {
+        rawOnceHandlers[event, default: []].append(handler)
+    }
+
+    /// Removes raw listeners for an event.
+    ///
+    /// Handler identity is not tracked, so this clears every persistent and
+    /// one-shot listener registered for `event`.
+    /// - Parameters:
+    ///   - event: The wire event name.
+    ///   - handler: Ignored; present for call-site symmetry.
+    public func off(_ event: String, handler: @escaping (Any) -> Void) {
+        rawHandlers[event] = nil
+        rawOnceHandlers[event] = nil
+    }
+
+    /// Fans a decoded raw event out to registered listeners.
+    private func dispatchRaw(_ event: String, _ payload: Any) {
+        if let handlers = rawHandlers[event] {
+            for handler in handlers { handler(payload) }
+        }
+        if let onceHandlers = rawOnceHandlers[event] {
+            rawOnceHandlers[event] = nil
+            for handler in onceHandlers { handler(payload) }
+        }
+    }
+
     // MARK: - Internal Methods
     
     internal func getSocket() -> SocketIOClient? {
@@ -375,11 +454,13 @@ public final class OddSocketsClient: ObservableObject {
         
         let manager = SocketManager(socketURL: url, config: [
             .log(false),
-            .compress(true),
+            .compress,
             .connectParams(["apiKey": config.apiKey, "userId": userId]),
-            .forceWebsockets(true)
+            .forceWebsockets(true),
+            .handleQueue(socketQueue)
         ])
-        
+
+        socketManager = manager
         socket = manager.defaultSocket
         
         setupSocketEventHandlers()
@@ -413,7 +494,17 @@ public final class OddSocketsClient: ObservableObject {
     
     private func setupSocketEventHandlers() {
         guard let socket = socket else { return }
-        
+
+        // Fan every wire event out to the raw listener surface so enhanced
+        // broadcasts (user_typing, reaction_added, ...) and enhanced
+        // request/response replies reach registered on()/once() handlers.
+        socket.onAny { [weak self] anyEvent in
+            let payload: Any = anyEvent.items?.first ?? [String: Any]()
+            Task { @MainActor in
+                self?.dispatchRaw(anyEvent.event, payload)
+            }
+        }
+
         socket.on(clientEvent: .disconnect) { [weak self] data, _ in
             Task { @MainActor in
                 guard let self = self else { return }
@@ -541,16 +632,8 @@ public final class OddSocketsClient: ObservableObject {
     
     // MARK: - Client Identifier Generation
     
-    /// Generate consistent client identifier for session stickiness
-    private func _generateClientIdentifier() -> String {
-        // Create a consistent identifier based on API key and user ID
-        let baseId = userId
-        let apiKeyHash = _hashString(config.apiKey)
-        return "\(apiKeyHash)_\(baseId)"
-    }
-    
     /// Simple hash function for API key
-    private func _hashString(_ str: String) -> String {
+    private static func _hashString(_ str: String) -> String {
         var hash: Int = 0
         if str.isEmpty { return String(hash) }
         
@@ -574,6 +657,13 @@ public final class OddSocketsClient: ObservableObject {
     public func getSessionInfo() -> [String: Any]? {
         return sessionInfo
     }
+
+    // MARK: - Enhanced Features
+
+    /// The enhanced (Slack-like) feature surface for this client: threads,
+    /// reactions, typing, presence, read receipts, and more, all over the same
+    /// live socket.
+    public private(set) lazy var enhanced: EnhancedFeatures = EnhancedFeatures(client: self)
 }
 
 // MARK: - Convenience Extensions
