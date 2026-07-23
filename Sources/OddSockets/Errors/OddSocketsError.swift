@@ -25,7 +25,13 @@ public enum OddSocketsError: Error, LocalizedError, CustomStringConvertible {
     
     /// Timeout error.
     case timeout(String)
-    
+
+    /// The client is not connected to OddSockets.
+    case notConnected
+
+    /// An error reported by the server for a specific operation.
+    case serverError(String)
+
     /// Generic error with custom code and details.
     case generic(String, code: String? = nil, details: [String: Any]? = nil)
     
@@ -61,6 +67,10 @@ public enum OddSocketsError: Error, LocalizedError, CustomStringConvertible {
             }
         case .timeout(let message):
             return "Timeout: \(message)"
+        case .notConnected:
+            return "Not connected to OddSockets"
+        case .serverError(let message):
+            return "Server Error: \(message)"
         case .generic(let message, _, _):
             return message
         }
@@ -84,6 +94,10 @@ public enum OddSocketsError: Error, LocalizedError, CustomStringConvertible {
             return "Network communication failed."
         case .timeout:
             return "Operation timed out."
+        case .notConnected:
+            return "The client is not connected to OddSockets."
+        case .serverError:
+            return "The server reported an error for the requested operation."
         case .generic:
             return "An error occurred."
         }
@@ -107,6 +121,10 @@ public enum OddSocketsError: Error, LocalizedError, CustomStringConvertible {
             return "Check your network connection and try again."
         case .timeout:
             return "Try again or increase the timeout value."
+        case .notConnected:
+            return "Call connect() and wait for the connected state before this operation."
+        case .serverError:
+            return "Check the operation parameters and try again."
         case .generic:
             return "Please try again or contact support if the problem persists."
         }
@@ -139,6 +157,10 @@ public enum OddSocketsError: Error, LocalizedError, CustomStringConvertible {
             return ErrorCodes.connectionFailed
         case .timeout:
             return ErrorCodes.operationTimeout
+        case .notConnected:
+            return "NOT_CONNECTED"
+        case .serverError:
+            return "SERVER_ERROR"
         case .generic(_, let code, _):
             return code ?? "UNKNOWN_ERROR"
         }
@@ -282,7 +304,7 @@ extension Result where Failure == OddSocketsError {
     /// Creates a failure result from a generic error.
     /// - Parameter error: The error to convert
     /// - Returns: A failure result with OddSocketsError
-    public static func failure(_ error: Error) -> Result<Success, OddSocketsError> {
+    public static func failing(with error: Error) -> Result<Success, OddSocketsError> {
         return .failure(OddSocketsError.from(error))
     }
 }

@@ -90,16 +90,13 @@ public final class OddSocketsChannel: ObservableObject {
         guard let client = client else {
             throw OddSocketsError.channelError("Client not available", channel: name)
         }
-        
         guard client.isConnected else {
             throw OddSocketsError.connectionFailed("Not connected to OddSockets")
         }
-        
         guard !isSubscribed else {
             logger.warning("Channel '\(name)' already subscribed")
             return
         }
-        
         logger.info("Subscribing to channel: \(name)")
         
         do {
@@ -122,20 +119,14 @@ public final class OddSocketsChannel: ObservableObject {
             ]
             
             socket.emit("subscribe", subscribeData)
-            
-            // Simulate network delay
-            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
-            
+
             isSubscribed = true
-            
+
             // If presence is enabled, add current user
             if options.enablePresence {
                 await updatePresence(addUser: client.userId)
             }
-            
-            // Simulate receiving initial messages
-            await simulateInitialMessages()
-            
+
             logger.info("Subscribed to channel: \(name)")
             
         } catch {
@@ -157,9 +148,10 @@ public final class OddSocketsChannel: ObservableObject {
         handler: @escaping MessageHandler,
         options: SubscribeOptions = SubscribeOptions()
     ) async throws {
-        await try subscribe(handler: { message in
-            handler(message)
-        }, options: options)
+        // Wrap in an explicitly async closure so overload resolution routes to
+        // the AsyncMessageHandler variant below, not back into this method.
+        let asyncHandler: AsyncMessageHandler = { message in handler(message) }
+        try await subscribe(handler: asyncHandler, options: options)
     }
     
     /// Unsubscribes from channel messages.
@@ -248,26 +240,21 @@ public final class OddSocketsChannel: ObservableObject {
                 ]
             ]
             
+            // Publish over the real transport. Delivery back to subscribers
+            // (including this client) happens only via the worker's 'message'
+            // broadcast, never a local echo, so two-client fan-out is genuine.
             socket.emit("publish", publishData)
-            
-            // Simulate network delay
-            try await Task.sleep(nanoseconds: 20_000_000) // 20ms
-            
-            // Store in history if requested
+
+            // Store in local history if requested.
             if options?.storeInHistory == true || subscriptionOptions?.retainHistory == true {
                 messageHistory.append(messageObj)
-                
+
                 // Keep only last 100 messages
                 if messageHistory.count > 100 {
                     messageHistory.removeFirst(messageHistory.count - 100)
                 }
             }
-            
-            // Deliver to local subscriber if subscribed
-            if isSubscribed {
-                await deliverMessage(messageObj)
-            }
-            
+
             logger.debug("Published message to channel '\(name)': \(message?.description ?? "nil")")
             
             return PublishResult(
@@ -436,13 +423,60 @@ public final class OddSocketsChannel: ObservableObject {
     // MARK: - Private Methods
     
     private func handleMessage(data: [String: Any]) async {
-        do {
-            let jsonData = try JSONSerialization.data(withJSONObject: data)
-            let message = try JSONDecoder().decode(Message.self, from: jsonData)
-            await deliverMessage(message)
-        } catch {
-            logger.error("Error handling message for channel '\(name)': \(error)")
+        // Map the worker's broadcast envelope onto a Message. The wire shape is
+        //   { id, channel, message: <payload>, publisher: { userId }, timestamp: ISO8601, metadata }
+        // which does not line up with Message's synthesized Codable, so decode by hand.
+        let id = (data["id"] as? String) ?? (data["messageId"] as? String) ?? UUID().uuidString
+        let channelName = (data["channel"] as? String) ?? name
+
+        let payload = data["message"] ?? data["data"]
+        let messageData: AnyCodable? = payload.map { AnyCodable($0) }
+
+        var userId = data["userId"] as? String ?? data["user_id"] as? String
+        if userId == nil, let publisher = data["publisher"] as? [String: Any] {
+            userId = publisher["userId"] as? String
         }
+
+        let timestamp = Self.parseTimestamp(data["timestamp"]) ?? Date()
+
+        var metadata: [String: AnyCodable]?
+        if let rawMeta = data["metadata"] as? [String: Any], !rawMeta.isEmpty {
+            metadata = rawMeta.mapValues { AnyCodable($0) }
+        }
+
+        let message = Message(
+            id: id,
+            channel: channelName,
+            data: messageData,
+            timestamp: timestamp,
+            userId: userId,
+            metadata: metadata
+        )
+        await deliverMessage(message)
+    }
+
+    /// Parses a timestamp that may arrive as an ISO8601 string, epoch seconds,
+    /// or epoch milliseconds.
+    private static func parseTimestamp(_ raw: Any?) -> Date? {
+        if let str = raw as? String {
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = iso.date(from: str) { return date }
+            iso.formatOptions = [.withInternetDateTime]
+            if let date = iso.date(from: str) { return date }
+            if let seconds = Double(str) {
+                return Date(timeIntervalSince1970: seconds > 1_000_000_000_000 ? seconds / 1000 : seconds)
+            }
+            return nil
+        }
+        if let number = raw as? Double {
+            return Date(timeIntervalSince1970: number > 1_000_000_000_000 ? number / 1000 : number)
+        }
+        if let number = raw as? Int {
+            let seconds = Double(number)
+            return Date(timeIntervalSince1970: seconds > 1_000_000_000_000 ? seconds / 1000 : seconds)
+        }
+        return nil
     }
     
     private func handleSubscribed(data: [String: Any]) async {
@@ -458,15 +492,32 @@ public final class OddSocketsChannel: ObservableObject {
     }
     
     private func handlePresence(data: [String: Any]) async {
-        do {
-            let jsonData = try JSONSerialization.data(withJSONObject: data)
-            let presence = try JSONDecoder().decode(PresenceInfo.self, from: jsonData)
-            presenceInfo = presence
-            presenceSubject.send(presence)
-            await emitEvent(.presence, data: presence)
-        } catch {
-            logger.error("Error handling presence for channel '\(name)': \(error)")
+        // The worker sends either a full snapshot ({ channel, users, count }) or an
+        // incremental presence_change ({ channel, action, user, occupancy }). Handle
+        // both without treating the incremental shape as an error.
+        let channelName = (data["channel"] as? String) ?? name
+
+        var users = presenceInfo?.users ?? []
+        if let snapshotUsers = data["users"] as? [String] {
+            users = snapshotUsers
+        } else if let action = data["action"] as? String,
+                  let user = data["user"] as? [String: Any],
+                  let userId = user["userId"] as? String {
+            switch action {
+            case "join":
+                if !users.contains(userId) { users.append(userId) }
+            case "leave":
+                users.removeAll { $0 == userId }
+            default:
+                break
+            }
         }
+
+        let count = (data["count"] as? Int) ?? (data["occupancy"] as? Int) ?? users.count
+        let presence = PresenceInfo(channel: channelName, users: users, count: count, timestamp: Date())
+        presenceInfo = presence
+        presenceSubject.send(presence)
+        await emitEvent(.presence, data: presence)
     }
     
     private func handleHistory(data: [String: Any]) async {
@@ -504,32 +555,6 @@ public final class OddSocketsChannel: ObservableObject {
             return messageString.localizedCaseInsensitiveContains(expression)
         } catch {
             return true // If filter evaluation fails, pass the message
-        }
-    }
-    
-    private func simulateInitialMessages() async {
-        guard isSubscribed, let messageHandler = messageHandler else { return }
-        
-        // Create a welcome message
-        let welcomeMessage = Message(
-            id: "msg_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())",
-            channel: name,
-            data: AnyCodable([
-                "type": "system",
-                "text": "Welcome to channel '\(name)'!",
-                "timestamp": ISO8601DateFormatter().string(from: Date())
-            ]),
-            timestamp: Date(),
-            userId: "system"
-        )
-        
-        // Deliver after a short delay
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-        await deliverMessage(welcomeMessage)
-        
-        // Store in history if enabled
-        if subscriptionOptions?.retainHistory == true {
-            messageHistory.append(welcomeMessage)
         }
     }
     

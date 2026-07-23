@@ -3,6 +3,7 @@ import Combine
 
 /// Enhanced Features for OddSockets Swift SDK
 /// Provides 67 new Slack-like events with async/await support
+@MainActor
 public class EnhancedFeatures {
     private weak var client: OddSocketsClient?
     private let timeout: TimeInterval = 10.0
