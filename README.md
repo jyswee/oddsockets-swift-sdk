@@ -388,6 +388,73 @@ do {
 }
 ```
 
+## Enhanced Features
+
+Beyond core pub/sub, OddSockets ships a Slack-like **enhanced surface** — reactions,
+typing indicators, threads, read receipts, presence/status, notifications, DMs,
+channel management, message editing and search. It lives on `client.enhanced`, all
+travelling over the same live socket as core messaging. The pattern is always the
+same:
+
+1. **Send** an action with a `client.enhanced.*` method (camelCase, labelled
+   arguments).
+2. **Receive** the paired broadcast with `client.on("<event>") { data in ... }` — the
+   worker fans every enhanced broadcast onto the client's raw event surface (delivered
+   as `Any`, typically a `[String: Any]`).
+
+```swift
+import OddSockets
+
+let config = OddSocketsConfig(apiKey: "ak_your_api_key_here", userId: "alice", autoConnect: false)
+let client = try OddSocketsClient(config: config)
+try await client.connect()
+
+let channel = try client.channel("room-42")
+try await channel.subscribe { message in
+    print("Received: \(message.data)")
+}
+
+// Receive-path: enhanced broadcasts arrive on the client's raw event surface
+client.on("user_typing")    { data in print("someone is typing: \(data)") }
+client.on("reaction_added") { data in print("reaction added: \(data)") }
+client.on("thread_reply")   { data in print("new thread reply: \(data)") }
+
+// Send-path: fire-and-forget enhanced actions over the live socket
+client.enhanced.startTyping(userId: "alice", channel: "room-42")
+client.enhanced.addReaction(messageId: "msg-1", channel: "room-42", emoji: ":thumbsup:", userId: "alice", userName: "Alice")
+
+// async request methods return the worker ack as [String: Any]
+let reply = try await client.enhanced.threadReply(
+    channel: "room-42",
+    parentMessageId: "msg-1",
+    message: "Replying in the thread",
+    userId: "alice",
+    userName: "Alice"
+)
+print("thread reply ack: \(reply)")
+```
+
+Fire-and-forget actions (typing, reactions, status, message edits…) return `Void`;
+query and request-style methods (`get*`, `search*`, `threadReply`, `createChannel`, …)
+are `async throws` and return `[String: Any]` with the worker response.
+
+| Area | Requests (`client.enhanced.*`) | Broadcast events (`client.on`) |
+|------|--------------------------------|--------------------------------|
+| Typing | `startTyping`, `stopTyping` | `user_typing`, `user_stopped_typing` |
+| Reactions | `addReaction`, `removeReaction`, `getReactions` | `reaction_added`, `reaction_removed` |
+| Threads | `threadReply`, `getThread`, `subscribeThread`, `followThread`, `unfollowThread`, `markThreadRead` | `thread_reply`, `thread_subscribed`, `thread_followed`, `thread_read_updated` |
+| Read receipts | `markRead`, `markAllRead`, `getUnreadCounts` | `user_read`, `unread_count_updated`, `all_marked_read` |
+| Messages | `editMessage`, `deleteMessage`, `pinMessage`, `unpinMessage`, `getPinnedMessages` | `message_edited`, `message_deleted`, `message_pinned`, `message_unpinned` |
+| Presence & status | `setStatus`, `setCustomStatus`, `clearCustomStatus`, `setDND`, `clearDND`, `getUserPresence` | `user_status_changed`, `custom_status_updated`, `dnd_status_changed` |
+| Channels | `createChannel`, `updateChannel`, `archiveChannel`, `inviteToChannel`, `joinChannel`, `leaveChannel`, `getChannelMembers` | `channel_created`, `channel_updated`, `user_invited`, `user_joined_channel`, `user_left_channel` |
+| DMs | `createDM`, `sendDM`, `getDMConversations` | `dm_created`, `dm_received` |
+| Notifications | `subscribeNotifications`, `getNotifications`, `markNotificationRead`, `clearNotifications` | `notification`, `notification_read`, `notifications_cleared` |
+| Search | `searchMessages`, `searchInChannel`, `searchByUser`, `filterMessages` | (query results returned as `[String: Any]`) |
+
+For any worker event not wrapped above, subscribe with the raw
+`client.on("<event>") { data in ... }` API — all enhanced broadcasts are forwarded onto
+the client surface.
+
 ## API Reference
 
 ### OddSocketsClient
@@ -417,6 +484,11 @@ func channel(_ name: String) throws -> OddSocketsChannel
 func publishBulk(_ messages: [BulkMessage]) async throws -> [BulkResult]
 func on(_ eventType: EventType, handler: @escaping AsyncEventHandler)
 func off(_ eventType: EventType)
+
+// Enhanced (Slack-like) surface
+var enhanced: EnhancedFeatures { get }
+func on(_ event: String, handler: @escaping (Any) -> Void)   // enhanced broadcasts
+func emit(_ event: String, data: [String: Any])
 ```
 
 ### OddSocketsChannel
