@@ -31,6 +31,9 @@ public final class OddSocketsChannel: ObservableObject {
     private let logger: Logger
     private var messageHandler: AsyncMessageHandler?
     private var eventHandlers: [EventType: [(Any?) async -> Void]] = [:]
+    /// The in-flight getHistory waiter, resolved by the worker's query:true
+    /// "history" response (see handleHistory / BUG-2026-0727-0012).
+    private var pendingHistory: CheckedContinuation<[Message], Error>?
     private let operationQueue = DispatchQueue(label: "com.oddsockets.channel", qos: .userInitiated)
     
     // MARK: - Subjects for Combine
@@ -284,48 +287,56 @@ public final class OddSocketsChannel: ObservableObject {
         guard let client = client else {
             throw OddSocketsError.channelError("Client not available", channel: name)
         }
-        
+
         guard client.isConnected else {
             throw OddSocketsError.connectionFailed("Not connected to OddSockets")
         }
-        
-        do {
-            // Simulate API call delay
-            try await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            
-            var messages = messageHistory
-            
-            // Filter by time range if specified
-            if let start = options?.start {
-                messages = messages.filter { $0.timestamp >= start }
-            }
-            
-            if let end = options?.end {
-                messages = messages.filter { $0.timestamp <= end }
-            }
-            
-            // Sort messages
-            if options?.reverse == true {
-                messages.sort { $0.timestamp > $1.timestamp }
-            } else {
-                messages.sort { $0.timestamp < $1.timestamp }
-            }
-            
-            // Apply limit
-            if let limit = options?.limit, limit > 0 {
-                messages = Array(messages.prefix(limit))
-            }
-            
-            logger.debug("Retrieved \(messages.count) messages from channel '\(name)' history")
-            return messages
-            
-        } catch {
-            logger.error("Failed to get history for channel '\(name)': \(error)")
+
+        guard let socket = client.getSocket() else {
+            throw OddSocketsError.connectionFailed("Socket not available")
+        }
+
+        // Only one history request may be in flight per channel, since the
+        // "history" response is correlated by a single continuation.
+        guard pendingHistory == nil else {
             throw OddSocketsError.channelError(
-                "Failed to get history for channel '\(name)'",
+                "A history request is already in progress",
                 channel: name
             )
         }
+
+        // Query the shared store over the real transport; the worker replies with
+        // a query:true "history" event that resolves handleHistory below. Do NOT
+        // fall back to local messageHistory - that only reflects messages this
+        // client happened to observe, not the authoritative store.
+        var payload: [String: Any] = [
+            "channel": name,
+            "count": options?.limit ?? 50
+        ]
+        let iso = ISO8601DateFormatter()
+        if let start = options?.start {
+            payload["start"] = iso.string(from: start)
+        }
+        if let end = options?.end {
+            payload["end"] = iso.string(from: end)
+        }
+
+        let messages: [Message] = try await withCheckedThrowingContinuation { continuation in
+            self.pendingHistory = continuation
+            socket.emit("get_history", payload)
+
+            // Timeout guard - matches the 10s used by the other SDKs.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                if let pending = self.pendingHistory {
+                    self.pendingHistory = nil
+                    pending.resume(throwing: OddSocketsError.operationTimeout("History request timeout"))
+                }
+            }
+        }
+
+        logger.debug("Retrieved \(messages.count) messages from channel '\(name)' history")
+        return messages
     }
     
     // MARK: - Presence Management
@@ -521,7 +532,48 @@ public final class OddSocketsChannel: ObservableObject {
     }
     
     private func handleHistory(data: [String: Any]) async {
-        // Handle history response if needed
+        // The worker emits "history" both as the explicit get_history RESPONSE
+        // (query:true) and as a fire-and-forget on-join snapshot (~10 msgs, no
+        // query flag). Only the query:true response may resolve a pending
+        // getHistory waiter; ignore the snapshot so it can't return the wrong
+        // data. BUG-2026-0727-0012.
+        guard (data["query"] as? Bool) == true else { return }
+        guard let pending = pendingHistory else { return }
+        pendingHistory = nil
+
+        let rawMessages = (data["messages"] as? [[String: Any]]) ?? []
+        let messages = rawMessages.map { Self.messageFromEnvelope($0, defaultChannel: name) }
+        pending.resume(returning: messages)
+    }
+
+    /// Decodes a worker history/broadcast envelope into a Message. Mirrors the
+    /// inline mapping used by handleMessage.
+    private static func messageFromEnvelope(_ data: [String: Any], defaultChannel: String) -> Message {
+        let id = (data["id"] as? String) ?? (data["messageId"] as? String) ?? UUID().uuidString
+        let channelName = (data["channel"] as? String) ?? defaultChannel
+        let payload = data["message"] ?? data["data"]
+        let messageData: AnyCodable? = payload.map { AnyCodable($0) }
+
+        var userId = data["userId"] as? String ?? data["user_id"] as? String
+        if userId == nil, let publisher = data["publisher"] as? [String: Any] {
+            userId = publisher["userId"] as? String
+        }
+
+        let timestamp = parseTimestamp(data["timestamp"]) ?? Date()
+
+        var metadata: [String: AnyCodable]?
+        if let rawMeta = data["metadata"] as? [String: Any], !rawMeta.isEmpty {
+            metadata = rawMeta.mapValues { AnyCodable($0) }
+        }
+
+        return Message(
+            id: id,
+            channel: channelName,
+            data: messageData,
+            timestamp: timestamp,
+            userId: userId,
+            metadata: metadata
+        )
     }
     
     private func deliverMessage(_ message: Message) async {
