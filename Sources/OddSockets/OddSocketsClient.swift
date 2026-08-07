@@ -402,17 +402,23 @@ public final class OddSocketsClient: ObservableObject {
     // MARK: - Private Methods
     
     private func getWorkerAssignment() async throws {
-        // Discover the optimal manager URL automatically
-        let managerUrl = await ManagerDiscovery.shared.discoverManagerUrl(apiKey: config.apiKey)
-        
-        var urlComponents = URLComponents(string: "\(managerUrl)/api/cluster/select-worker")!
+        // Use the configured manager verbatim; never silently retarget production.
+        let managerUrl = try ManagerDiscovery(configuredUrl: config.managerUrl).discoverManagerUrl()
+
+        guard var urlComponents = URLComponents(string: "\(managerUrl)/api/cluster/select-worker") else {
+            throw OddSocketsError.invalidConfiguration("Invalid managerUrl: \(managerUrl)")
+        }
         urlComponents.queryItems = [
             URLQueryItem(name: "apiKey", value: config.apiKey),
             URLQueryItem(name: "userId", value: userId),
             URLQueryItem(name: "clientIdentifier", value: clientIdentifier)
         ]
-        
-        var request = URLRequest(url: urlComponents.url!)
+
+        guard let requestUrl = urlComponents.url else {
+            throw OddSocketsError.invalidConfiguration("Invalid managerUrl: \(managerUrl)")
+        }
+
+        var request = URLRequest(url: requestUrl)
         request.httpMethod = "GET"
         request.setValue(config.apiKey, forHTTPHeaderField: "X-API-Key")
         request.setValue("OddSockets-Swift-SDK/0.1.0-beta.1", forHTTPHeaderField: "User-Agent")

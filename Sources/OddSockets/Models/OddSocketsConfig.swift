@@ -5,7 +5,10 @@ public struct OddSocketsConfig {
     /// The OddSockets API key (required).
     public let apiKey: String
     
-    /// The manager URL (optional, defaults to https://connect.oddsockets.tyga.network).
+    /// The manager URL the client will contact.
+    ///
+    /// When not supplied it resolves from `ODDSOCKETS_MANAGER_URL`, and only then
+    /// from the built-in default. Whatever ends up here is used verbatim.
     public let managerUrl: String
     
     /// The user identifier (optional, auto-generated if not provided).
@@ -26,7 +29,8 @@ public struct OddSocketsConfig {
     /// Initializes a new OddSocketsConfig.
     /// - Parameters:
     ///   - apiKey: Your OddSockets API key
-    ///   - managerUrl: Manager service URL
+    ///   - managerUrl: Manager service URL, or `nil` to resolve from
+    ///     `ODDSOCKETS_MANAGER_URL` and then the built-in default
     ///   - userId: User identifier
     ///   - autoConnect: Auto-connect on creation
     ///   - reconnectAttempts: Max reconnection attempts
@@ -34,7 +38,7 @@ public struct OddSocketsConfig {
     ///   - timeout: Request timeout in seconds
     public init(
         apiKey: String,
-        managerUrl: String = "https://connect.oddsockets.tyga.network",
+        managerUrl: String? = nil,
         userId: String? = nil,
         autoConnect: Bool = true,
         reconnectAttempts: Int = 5,
@@ -42,7 +46,7 @@ public struct OddSocketsConfig {
         timeout: TimeInterval = 10
     ) {
         self.apiKey = apiKey
-        self.managerUrl = managerUrl
+        self.managerUrl = managerUrl ?? ManagerDiscovery.resolvedDefaultManagerUrl()
         self.userId = userId
         self.autoConnect = autoConnect
         self.reconnectAttempts = reconnectAttempts
@@ -64,11 +68,11 @@ public struct OddSocketsConfig {
         guard !managerUrl.isEmpty else {
             throw OddSocketsError.invalidConfiguration("Manager URL is required")
         }
-        
-        guard URL(string: managerUrl) != nil else {
-            throw OddSocketsError.invalidConfiguration("Invalid manager URL format")
-        }
-        
+
+        // Fail here rather than at connect time; a bad manager URL must never
+        // degrade into a request against the default production endpoint.
+        _ = try ManagerDiscovery.validate(managerUrl)
+
         guard reconnectAttempts >= 0 else {
             throw OddSocketsError.invalidConfiguration("Reconnect attempts must be non-negative")
         }
@@ -86,7 +90,7 @@ public struct OddSocketsConfig {
 /// Builder class for creating OddSocketsConfig instances using a fluent interface.
 public class OddSocketsConfigBuilder {
     private var apiKey: String = ""
-    private var managerUrl: String = "https://connect.oddsockets.tyga.network"
+    private var managerUrl: String?
     private var userId: String?
     private var autoConnect: Bool = true
     private var reconnectAttempts: Int = 5
