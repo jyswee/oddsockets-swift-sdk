@@ -43,6 +43,46 @@ public enum EventType: String, CaseIterable, Codable {
     
     /// Emitted when reconnection attempts are exhausted.
     case maxReconnectAttemptsReached = "max_reconnect_attempts_reached"
+
+    /// Emitted after a minted realtime token is silently refreshed ahead of expiry.
+    case tokenRefreshed = "token_refreshed"
+}
+
+/// A short-lived realtime token minted by your own backend.
+///
+/// Game and app clients hand one of these to the SDK through a
+/// `tokenProvider` callback instead of shipping a static API key. The client
+/// presents `token` on the manager/worker handshake and uses `expiresAt`/`exp`
+/// to time a silent pre-expiry refresh.
+public struct OddSocketsToken {
+    /// The realtime token to present in place of an API key.
+    public let token: String
+
+    /// Absolute expiry as an ISO-8601 string or epoch (seconds or ms), if known.
+    public let expiresAt: String?
+
+    /// Absolute expiry as epoch seconds, if known.
+    public let exp: Int?
+
+    /// The manager base URL the token was minted for, if the backend returned one.
+    public let baseUrl: String?
+
+    /// The identity the token was minted for, if known.
+    public let identity: String?
+
+    public init(
+        token: String,
+        expiresAt: String? = nil,
+        exp: Int? = nil,
+        baseUrl: String? = nil,
+        identity: String? = nil
+    ) {
+        self.token = token
+        self.expiresAt = expiresAt
+        self.exp = exp
+        self.baseUrl = baseUrl
+        self.identity = identity
+    }
 }
 
 /// Type-erased wrapper for any Codable value.
@@ -293,19 +333,19 @@ extension EventType {
     /// Whether the event type represents a connection-related event.
     public var isConnectionEvent: Bool {
         switch self {
-        case .connected, .disconnected, .reconnected, .workerAssigned, .maxReconnectAttemptsReached:
+        case .connected, .disconnected, .reconnected, .workerAssigned, .maxReconnectAttemptsReached, .tokenRefreshed:
             return true
         case .error, .message, .presence:
             return false
         }
     }
-    
+
     /// Whether the event type represents a message-related event.
     public var isMessageEvent: Bool {
         switch self {
         case .message, .presence:
             return true
-        case .connected, .disconnected, .reconnected, .error, .workerAssigned, .maxReconnectAttemptsReached:
+        case .connected, .disconnected, .reconnected, .error, .workerAssigned, .maxReconnectAttemptsReached, .tokenRefreshed:
             return false
         }
     }

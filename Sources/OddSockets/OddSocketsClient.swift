@@ -44,6 +44,13 @@ public final class OddSocketsClient: ObservableObject {
     private var reconnectAttempts: Int = 0
     private var heartbeatTimer: Timer?
     private var connectionTask: Task<Void, Never>?
+
+    // Token-auth (minted-token) state. When a tokenProvider is configured the
+    // client resolves a fresh token before every (re)connect and refreshes it
+    // silently ahead of expiry.
+    private var currentToken: String?
+    private var tokenExpiresAtMs: Int?
+    private var tokenRefreshTask: Task<Void, Never>?
     
     // Session stickiness properties
     private let clientIdentifier: String
@@ -104,7 +111,9 @@ public final class OddSocketsClient: ObservableObject {
                 autoConnect: config.autoConnect,
                 reconnectAttempts: config.reconnectAttempts,
                 heartbeatInterval: config.heartbeatInterval,
-                timeout: config.timeout
+                timeout: config.timeout,
+                tokenProvider: config.tokenProvider,
+                tokenRefreshLeadMs: config.tokenRefreshLeadMs
             )
         }
 
@@ -115,7 +124,10 @@ public final class OddSocketsClient: ObservableObject {
         // Generate client identifier for session stickiness. Computed from
         // static helpers so no instance method is called before init completes.
         let resolvedUserId = resolvedConfig.userId ?? "anonymous"
-        self.clientIdentifier = "\(Self._hashString(resolvedConfig.apiKey))_\(resolvedUserId)"
+        // In token mode there is no API key; seed the sticky-session hash with a
+        // stable fallback so the identifier is still deterministic per user.
+        let identifierSeed = resolvedConfig.apiKey.isEmpty ? "token-client" : resolvedConfig.apiKey
+        self.clientIdentifier = "\(Self._hashString(identifierSeed))_\(resolvedUserId)"
 
         logger?.info("OddSockets client initialized for user: \(resolvedUserId)")
         
@@ -165,19 +177,28 @@ public final class OddSocketsClient: ObservableObject {
         logger.info("Connecting to OddSockets...")
         
         do {
+            // Step 0: In token mode, resolve a fresh minted token before every
+            // (re)connect. It is presented in place of an API key from here on.
+            if isTokenMode {
+                try await resolveToken()
+            }
+
             // Step 1: Get worker assignment from manager
             try await getWorkerAssignment()
-            
+
             // Step 2: Connect to assigned worker
             try await connectToWorker()
-            
+
             connectionState = .connected
             isConnected = true
             reconnectAttempts = 0
-            
+
             // Start heartbeat
             startHeartbeat()
-            
+
+            // Arm the silent pre-expiry token refresh.
+            scheduleTokenRefresh()
+
             logger.info("Successfully connected to OddSockets")
             await emitEvent(.connected, data: ["userId": userId, "timestamp": Date()])
             
@@ -211,7 +232,11 @@ public final class OddSocketsClient: ObservableObject {
         
         // Stop heartbeat
         stopHeartbeat()
-        
+
+        // Stop any pending token refresh
+        tokenRefreshTask?.cancel()
+        tokenRefreshTask = nil
+
         // Unsubscribe from all channels
         for channel in channels.values {
             await channel.unsubscribe()
@@ -408,8 +433,12 @@ public final class OddSocketsClient: ObservableObject {
         guard var urlComponents = URLComponents(string: "\(managerUrl)/api/cluster/select-worker") else {
             throw OddSocketsError.invalidConfiguration("Invalid managerUrl: \(managerUrl)")
         }
+        // In token mode present the minted token instead of an API key.
+        let authQueryItem = isTokenMode
+            ? URLQueryItem(name: "token", value: currentToken)
+            : URLQueryItem(name: "apiKey", value: config.apiKey)
         urlComponents.queryItems = [
-            URLQueryItem(name: "apiKey", value: config.apiKey),
+            authQueryItem,
             URLQueryItem(name: "userId", value: userId),
             URLQueryItem(name: "clientIdentifier", value: clientIdentifier)
         ]
@@ -420,7 +449,11 @@ public final class OddSocketsClient: ObservableObject {
 
         var request = URLRequest(url: requestUrl)
         request.httpMethod = "GET"
-        request.setValue(config.apiKey, forHTTPHeaderField: "X-API-Key")
+        if isTokenMode, let token = currentToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        } else {
+            request.setValue(config.apiKey, forHTTPHeaderField: "X-API-Key")
+        }
         request.setValue("OddSockets-Swift-SDK/0.1.0-beta.1", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = config.timeout
         
@@ -458,10 +491,15 @@ public final class OddSocketsClient: ObservableObject {
             throw OddSocketsError.workerAssignmentFailed("Invalid worker URL")
         }
         
+        // Present the minted token on the handshake in token mode, otherwise
+        // the API key.
+        let authParams: [String: Any] = isTokenMode
+            ? ["token": currentToken ?? "", "userId": userId]
+            : ["apiKey": config.apiKey, "userId": userId]
         let manager = SocketManager(socketURL: url, config: [
             .log(false),
             .compress,
-            .connectParams(["apiKey": config.apiKey, "userId": userId]),
+            .connectParams(authParams),
             .forceWebsockets(true),
             .handleQueue(socketQueue)
         ])
@@ -636,6 +674,105 @@ public final class OddSocketsClient: ObservableObject {
         socket?.emit("ping", ["timestamp": Date().timeIntervalSince1970])
     }
     
+    // MARK: - Token Auth (minted-token) Helpers
+
+    /// Whether the client authenticates with minted tokens rather than an API key.
+    private var isTokenMode: Bool {
+        return config.tokenProvider != nil
+    }
+
+    /// Resolves a fresh token from the provider and records its expiry.
+    ///
+    /// Pure: it does not (re)arm the refresh loop, so it is safe to call from
+    /// both the connect path and the refresh loop.
+    private func resolveToken() async throws {
+        guard let provider = config.tokenProvider else { return }
+
+        let minted = try await provider()
+        guard !minted.token.isEmpty else {
+            throw OddSocketsError.authenticationError("Token provider returned an empty token")
+        }
+
+        currentToken = minted.token
+        tokenExpiresAtMs = Self.expiryMs(from: minted)
+    }
+
+    /// Arms a single background loop that refreshes the token ahead of expiry.
+    private func scheduleTokenRefresh() {
+        tokenRefreshTask?.cancel()
+        guard isTokenMode else { return }
+
+        tokenRefreshTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self = self else { return }
+                guard let expiresAt = self.tokenExpiresAtMs else { return }
+
+                let nowMs = Int(Date().timeIntervalSince1970 * 1000)
+                let delayMs = max(expiresAt - nowMs - self.config.tokenRefreshLeadMs, 0)
+                try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                if Task.isCancelled { return }
+
+                do {
+                    try await self.resolveToken()
+                    await self.emitEvent(.tokenRefreshed, data: ["expiresAt": self.tokenExpiresAtMs as Any])
+                } catch {
+                    self.logger.warning("Token refresh failed: \(error)")
+                    return
+                }
+            }
+        }
+    }
+
+    /// Derives an absolute expiry in epoch milliseconds from a minted token.
+    ///
+    /// Prefers explicit fields (`exp` epoch seconds, then `expiresAt` as epoch or
+    /// ISO-8601), and finally falls back to decoding the JWT `exp` claim.
+    private static func expiryMs(from token: OddSocketsToken) -> Int? {
+        if let exp = token.exp {
+            return exp * 1000
+        }
+        if let expiresAt = token.expiresAt {
+            if let numeric = Double(expiresAt) {
+                // < 1e12 → seconds, otherwise already milliseconds.
+                return numeric < 1_000_000_000_000 ? Int(numeric * 1000) : Int(numeric)
+            }
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = formatter.date(from: expiresAt) {
+                return Int(date.timeIntervalSince1970 * 1000)
+            }
+            let plain = ISO8601DateFormatter()
+            if let date = plain.date(from: expiresAt) {
+                return Int(date.timeIntervalSince1970 * 1000)
+            }
+        }
+        return expiryFromJwt(token.token)
+    }
+
+    /// Decodes the `exp` claim (epoch seconds) from a JWT and returns it in ms.
+    private static func expiryFromJwt(_ jwt: String) -> Int? {
+        let segments = jwt.split(separator: ".")
+        guard segments.count >= 2 else { return nil }
+
+        var base64 = String(segments[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 { base64 += "=" }
+
+        guard let data = Data(base64Encoded: base64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        if let exp = json["exp"] as? Int {
+            return exp * 1000
+        }
+        if let exp = json["exp"] as? Double {
+            return Int(exp * 1000)
+        }
+        return nil
+    }
+
     // MARK: - Client Identifier Generation
     
     /// Simple hash function for API key

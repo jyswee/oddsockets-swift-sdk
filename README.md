@@ -186,6 +186,42 @@ let prodConfig = try OddSocketsConfigBuilder()
     .build()
 ```
 
+### Token auth for game clients (`tokenProvider`)
+
+Game and app clients should never ship a static API key. Instead, mint a
+short-lived realtime token from your own backend and hand it to the SDK through a
+`tokenProvider` callback. The client resolves a **fresh** token before every
+(re)connect, presents it on the manager/worker handshake in place of an API key,
+and silently refreshes it ahead of expiry.
+
+The callback is an `async throws` closure returning an `OddSocketsToken`, so it
+can do its own async HTTP. No `apiKey` is required when a `tokenProvider` is set.
+
+```swift
+let config = try OddSocketsConfigBuilder
+    .with(tokenProvider: {
+        // Your backend exchanges the player's session for a realtime token.
+        let minted = try await myBackend.mintRealtimeToken() // async HTTP call
+        return OddSocketsToken(
+            token: minted.token,
+            expiresAt: minted.expiresAt // ISO-8601 or epoch; used to time the refresh
+        )
+    })
+    .userId("player-42")
+    .build()
+
+let client = try OddSockets(config: config)
+try await client.connect()
+
+// Fired after each silent pre-expiry refresh.
+client.on("token_refreshed") { info in
+    // info = ["expiresAt": <epoch ms of the new token>]
+}
+```
+
+Tune how early the token refreshes with `.tokenRefreshLeadMs(120_000)` on the
+builder (default two minutes).
+
 ## Core Concepts
 
 ### Connection Management
