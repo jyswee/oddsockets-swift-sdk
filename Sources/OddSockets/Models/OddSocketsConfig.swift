@@ -2,9 +2,22 @@ import Foundation
 
 /// Configuration options for the OddSockets client.
 public struct OddSocketsConfig {
-    /// The OddSockets API key (required).
+    /// The OddSockets API key.
+    ///
+    /// Required unless a `tokenProvider` is supplied; game/app clients should
+    /// use a `tokenProvider` and leave this empty.
     public let apiKey: String
-    
+
+    /// Optional callback that mints a short-lived realtime token.
+    ///
+    /// When set, the client resolves a **fresh** token before every (re)connect,
+    /// presents it on the manager/worker handshake in place of an API key, and
+    /// silently refreshes it ahead of expiry. No `apiKey` is required.
+    public let tokenProvider: (() async throws -> OddSocketsToken)?
+
+    /// How early (in milliseconds) to refresh the token ahead of its expiry.
+    public let tokenRefreshLeadMs: Int
+
     /// The manager URL the client will contact.
     ///
     /// When not supplied it resolves from `ODDSOCKETS_MANAGER_URL`, and only then
@@ -37,13 +50,15 @@ public struct OddSocketsConfig {
     ///   - heartbeatInterval: Heartbeat interval in seconds
     ///   - timeout: Request timeout in seconds
     public init(
-        apiKey: String,
+        apiKey: String = "",
         managerUrl: String? = nil,
         userId: String? = nil,
         autoConnect: Bool = true,
         reconnectAttempts: Int = 5,
         heartbeatInterval: TimeInterval = 30,
-        timeout: TimeInterval = 10
+        timeout: TimeInterval = 10,
+        tokenProvider: (() async throws -> OddSocketsToken)? = nil,
+        tokenRefreshLeadMs: Int = 120_000
     ) {
         self.apiKey = apiKey
         self.managerUrl = managerUrl ?? ManagerDiscovery.resolvedDefaultManagerUrl()
@@ -52,19 +67,26 @@ public struct OddSocketsConfig {
         self.reconnectAttempts = reconnectAttempts
         self.heartbeatInterval = heartbeatInterval
         self.timeout = timeout
+        self.tokenProvider = tokenProvider
+        self.tokenRefreshLeadMs = tokenRefreshLeadMs
     }
     
     /// Validates the configuration.
     /// - Throws: `OddSocketsError.invalidConfiguration` if configuration is invalid
     public func validate() throws {
-        guard !apiKey.isEmpty else {
-            throw OddSocketsError.invalidConfiguration("API key is required")
+        // A tokenProvider stands in for a static API key: game/app clients mint
+        // a short-lived token instead of shipping a key, so only enforce the
+        // API-key rules when no provider is configured.
+        if tokenProvider == nil {
+            guard !apiKey.isEmpty else {
+                throw OddSocketsError.invalidConfiguration("API key is required")
+            }
+
+            guard apiKey.hasPrefix("ak_") else {
+                throw OddSocketsError.invalidConfiguration("Invalid API key format")
+            }
         }
-        
-        guard apiKey.hasPrefix("ak_") else {
-            throw OddSocketsError.invalidConfiguration("Invalid API key format")
-        }
-        
+
         guard !managerUrl.isEmpty else {
             throw OddSocketsError.invalidConfiguration("Manager URL is required")
         }
@@ -96,7 +118,9 @@ public class OddSocketsConfigBuilder {
     private var reconnectAttempts: Int = 5
     private var heartbeatInterval: TimeInterval = 30
     private var timeout: TimeInterval = 10
-    
+    private var tokenProvider: (() async throws -> OddSocketsToken)?
+    private var tokenRefreshLeadMs: Int = 120_000
+
     /// Creates a new builder instance.
     public init() {}
     
@@ -162,7 +186,25 @@ public class OddSocketsConfigBuilder {
         self.timeout = timeout
         return self
     }
-    
+
+    /// Sets the token provider used to mint short-lived realtime tokens.
+    /// - Parameter tokenProvider: An async callback returning a fresh `OddSocketsToken`
+    /// - Returns: The builder instance for chaining
+    @discardableResult
+    public func tokenProvider(_ tokenProvider: @escaping () async throws -> OddSocketsToken) -> OddSocketsConfigBuilder {
+        self.tokenProvider = tokenProvider
+        return self
+    }
+
+    /// Sets how early (in milliseconds) the token is refreshed ahead of expiry.
+    /// - Parameter leadMs: The refresh lead time in milliseconds
+    /// - Returns: The builder instance for chaining
+    @discardableResult
+    public func tokenRefreshLeadMs(_ leadMs: Int) -> OddSocketsConfigBuilder {
+        self.tokenRefreshLeadMs = leadMs
+        return self
+    }
+
     /// Builds the configuration.
     /// - Returns: The configured OddSocketsConfig instance
     /// - Throws: `OddSocketsError.invalidConfiguration` if configuration is invalid
@@ -174,9 +216,11 @@ public class OddSocketsConfigBuilder {
             autoConnect: autoConnect,
             reconnectAttempts: reconnectAttempts,
             heartbeatInterval: heartbeatInterval,
-            timeout: timeout
+            timeout: timeout,
+            tokenProvider: tokenProvider,
+            tokenRefreshLeadMs: tokenRefreshLeadMs
         )
-        
+
         try config.validate()
         return config
     }
@@ -199,5 +243,12 @@ extension OddSocketsConfigBuilder {
     /// - Returns: A builder instance with the API key set
     public static func with(apiKey: String) -> OddSocketsConfigBuilder {
         return OddSocketsConfigBuilder().apiKey(apiKey)
+    }
+
+    /// Creates a builder with a token provider pre-set (keyless auth).
+    /// - Parameter tokenProvider: An async callback returning a fresh `OddSocketsToken`
+    /// - Returns: A builder instance with the token provider set
+    public static func with(tokenProvider: @escaping () async throws -> OddSocketsToken) -> OddSocketsConfigBuilder {
+        return OddSocketsConfigBuilder().tokenProvider(tokenProvider)
     }
 }
