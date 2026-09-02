@@ -16,6 +16,9 @@ let package = Package(
         .library(
             name: "OddSockets",
             targets: ["OddSockets"]),
+        .executable(
+            name: "ChallengeRegression",
+            targets: ["ChallengeRegression"]),
     ],
     dependencies: [
         // Dependencies declare other packages that this package depends on.
@@ -34,6 +37,11 @@ let package = Package(
                 .product(name: "NIOFoundationCompat", package: "swift-nio"),
             ],
             path: "Sources/OddSockets"
+        ),
+        .executableTarget(
+            name: "ChallengeRegression",
+            dependencies: ["OddSockets"],
+            path: "Sources/ChallengeRegression"
         ),
         .testTarget(
             name: "OddSocketsTests",

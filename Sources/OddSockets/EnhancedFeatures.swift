@@ -964,4 +964,493 @@ public class EnhancedFeatures {
             client.emit("search_by_user", data: params)
         }
     }
+
+    // MARK: - Challenge / Leaderboard / Achievement Events
+
+    /// Create a challenge (competition/leaderboard).
+    ///
+    /// - Parameters:
+    ///   - challengeId: Stable identifier for the challenge.
+    ///   - metric: The scored metric (e.g. "score", "time").
+    ///   - ranked: Whether the challenge maintains a leaderboard. Defaults to worker behaviour when omitted.
+    ///   - channel: Optional channel to scope broadcasts to.
+    ///   - resultWebhookUrl: Optional webhook invoked when the challenge resolves.
+    ///   - standingsUrl: Optional URL for published standings.
+    public func createChallenge(
+        challengeId: String,
+        metric: String,
+        ranked: Bool? = nil,
+        channel: String? = nil,
+        resultWebhookUrl: String? = nil,
+        standingsUrl: String? = nil
+    ) async throws -> [String: Any] {
+        guard let client = client, client.isConnected else {
+            throw OddSocketsError.notConnected
+        }
+
+        var params: [String: Any] = [
+            "challengeId": challengeId,
+            "metric": metric
+        ]
+        if let ranked = ranked {
+            params["ranked"] = ranked
+        }
+        if let channel = channel {
+            params["channel"] = channel
+        }
+        if let resultWebhookUrl = resultWebhookUrl {
+            params["resultWebhookUrl"] = resultWebhookUrl
+        }
+        if let standingsUrl = standingsUrl {
+            params["standingsUrl"] = standingsUrl
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var successHandler: ((Any) -> Void)?
+            var errorHandler: ((Any) -> Void)?
+
+            successHandler = { data in
+                if let result = data as? [String: Any] {
+                    continuation.resume(returning: result)
+                }
+                client.off("challenge_create_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            errorHandler = { data in
+                if let error = data as? [String: Any],
+                   let event = error["event"] as? String,
+                   event == "challenge_create" {
+                    let message = error["message"] as? String ?? "Unknown error"
+                    continuation.resume(throwing: OddSocketsError.serverError(message))
+                }
+                client.off("challenge_create_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            client.once("challenge_create_success", handler: successHandler!)
+            client.once("error", handler: errorHandler!)
+            client.emit("challenge_create", data: params)
+        }
+    }
+
+    /// Report progress toward a challenge (fire-and-forget).
+    ///
+    /// The worker echoes `challenge_progress` (and `leaderboard_rank_change` when
+    /// the player's rank moves) to other members of the room.
+    public func reportProgress(
+        challengeId: String,
+        value: Double,
+        metric: String? = nil,
+        eventId: String? = nil,
+        cohort: String? = nil,
+        platform: String? = nil,
+        channel: String? = nil
+    ) {
+        guard let client = client, client.isConnected else { return }
+
+        var params: [String: Any] = [
+            "challengeId": challengeId,
+            "value": value
+        ]
+        if let metric = metric {
+            params["metric"] = metric
+        }
+        if let eventId = eventId {
+            params["eventId"] = eventId
+        }
+        if let cohort = cohort {
+            params["cohort"] = cohort
+        }
+        if let platform = platform {
+            params["platform"] = platform
+        }
+        if let channel = channel {
+            params["channel"] = channel
+        }
+
+        client.emit("challenge_progress", data: params)
+    }
+
+    /// Complete (resolve) a challenge for the current player.
+    ///
+    /// - Parameters:
+    ///   - challengeId: The challenge being resolved.
+    ///   - outcome: One of `completed`, `failed`, `expired`, `conceded`, `tied`.
+    ///   - eventId: Optional idempotency key.
+    ///   - reward: Optional reward payload granted on completion.
+    public func completeChallenge(
+        challengeId: String,
+        outcome: String,
+        eventId: String? = nil,
+        reward: [String: Any]? = nil
+    ) async throws -> [String: Any] {
+        guard let client = client, client.isConnected else {
+            throw OddSocketsError.notConnected
+        }
+
+        var params: [String: Any] = [
+            "challengeId": challengeId,
+            "outcome": outcome
+        ]
+        if let eventId = eventId {
+            params["eventId"] = eventId
+        }
+        if let reward = reward {
+            params["reward"] = reward
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var successHandler: ((Any) -> Void)?
+            var errorHandler: ((Any) -> Void)?
+
+            successHandler = { data in
+                if let result = data as? [String: Any] {
+                    continuation.resume(returning: result)
+                }
+                client.off("challenge_complete_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            errorHandler = { data in
+                if let error = data as? [String: Any],
+                   let event = error["event"] as? String,
+                   event == "challenge_complete" {
+                    let message = error["message"] as? String ?? "Unknown error"
+                    continuation.resume(throwing: OddSocketsError.serverError(message))
+                }
+                client.off("challenge_complete_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            client.once("challenge_complete_success", handler: successHandler!)
+            client.once("error", handler: errorHandler!)
+            client.emit("challenge_complete", data: params)
+        }
+    }
+
+    /// Unlock (or progress) an achievement (fire-and-forget).
+    ///
+    /// When `percentComplete` is below 100 the worker broadcasts
+    /// `achievement_progress`; at 100 (or when omitted) it broadcasts
+    /// `achievement_unlock`.
+    public func unlockAchievement(
+        achievementId: String,
+        name: String? = nil,
+        tier: String? = nil,
+        percentComplete: Double? = nil,
+        challengeId: String? = nil,
+        channel: String? = nil
+    ) {
+        guard let client = client, client.isConnected else { return }
+
+        var params: [String: Any] = [
+            "achievementId": achievementId
+        ]
+        if let name = name {
+            params["name"] = name
+        }
+        if let tier = tier {
+            params["tier"] = tier
+        }
+        if let percentComplete = percentComplete {
+            params["percentComplete"] = percentComplete
+        }
+        if let challengeId = challengeId {
+            params["challengeId"] = challengeId
+        }
+        if let channel = channel {
+            params["channel"] = channel
+        }
+
+        client.emit("achievement_unlock", data: params)
+    }
+
+    /// Get leaderboard standings for a challenge.
+    ///
+    /// - Parameters:
+    ///   - challengeId: The challenge to read standings for.
+    ///   - limit: Maximum rows to return. Defaults to 20.
+    ///   - offset: Row offset for pagination. Defaults to 0.
+    public func getStandings(
+        challengeId: String,
+        limit: Int = 20,
+        offset: Int = 0
+    ) async throws -> [String: Any] {
+        guard let client = client, client.isConnected else {
+            throw OddSocketsError.notConnected
+        }
+
+        let params: [String: Any] = [
+            "challengeId": challengeId,
+            "limit": limit,
+            "offset": offset
+        ]
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var successHandler: ((Any) -> Void)?
+            var errorHandler: ((Any) -> Void)?
+
+            successHandler = { data in
+                if let result = data as? [String: Any] {
+                    continuation.resume(returning: result)
+                }
+                client.off("challenge_standings_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            errorHandler = { data in
+                if let error = data as? [String: Any],
+                   let event = error["event"] as? String,
+                   event == "challenge_standings" {
+                    let message = error["message"] as? String ?? "Unknown error"
+                    continuation.resume(throwing: OddSocketsError.serverError(message))
+                }
+                client.off("challenge_standings_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            client.once("challenge_standings_success", handler: successHandler!)
+            client.once("error", handler: errorHandler!)
+            client.emit("challenge_standings", data: params)
+        }
+    }
+
+    /// Query achievement state for the current player.
+    ///
+    /// - Parameter achievementId: Optional achievement to scope the query to; omit to return all.
+    public func getAchievements(achievementId: String? = nil) async throws -> [String: Any] {
+        guard let client = client, client.isConnected else {
+            throw OddSocketsError.notConnected
+        }
+
+        var params: [String: Any] = [:]
+        if let achievementId = achievementId {
+            params["achievementId"] = achievementId
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var successHandler: ((Any) -> Void)?
+            var errorHandler: ((Any) -> Void)?
+
+            successHandler = { data in
+                if let result = data as? [String: Any] {
+                    continuation.resume(returning: result)
+                }
+                client.off("achievement_state", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            errorHandler = { data in
+                if let error = data as? [String: Any],
+                   let event = error["event"] as? String,
+                   event == "achievement_query" {
+                    let message = error["message"] as? String ?? "Unknown error"
+                    continuation.resume(throwing: OddSocketsError.serverError(message))
+                }
+                client.off("achievement_state", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            client.once("achievement_state", handler: successHandler!)
+            client.once("error", handler: errorHandler!)
+            client.emit("achievement_query", data: params)
+        }
+    }
+
+    /// Send a directed challenge invite to another user.
+    ///
+    /// The invitee receives a `challenge_invited` broadcast; subscribe with
+    /// `client.on("challenge_invited", ...)`.
+    ///
+    /// - Parameters:
+    ///   - toUserId: The recipient user id.
+    ///   - type: Invite type. Defaults to "match".
+    ///   - payload: Optional custom payload (<= 8KB).
+    ///   - ttl: Time-to-live in seconds. Defaults to 300.
+    ///   - channel: Optional channel to scope the invite to.
+    ///   - inviteId: Optional caller-supplied invite id.
+    public func sendChallengeInvite(
+        toUserId: String,
+        type: String = "match",
+        payload: [String: Any]? = nil,
+        ttl: Int = 300,
+        channel: String? = nil,
+        inviteId: String? = nil
+    ) async throws -> [String: Any] {
+        guard let client = client, client.isConnected else {
+            throw OddSocketsError.notConnected
+        }
+
+        var params: [String: Any] = [
+            "toUserId": toUserId,
+            "type": type,
+            "ttl": ttl
+        ]
+        if let payload = payload {
+            params["payload"] = payload
+        }
+        if let channel = channel {
+            params["channel"] = channel
+        }
+        if let inviteId = inviteId {
+            params["inviteId"] = inviteId
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var successHandler: ((Any) -> Void)?
+            var errorHandler: ((Any) -> Void)?
+
+            successHandler = { data in
+                if let result = data as? [String: Any] {
+                    continuation.resume(returning: result)
+                }
+                client.off("challenge_invite_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            errorHandler = { data in
+                if let error = data as? [String: Any],
+                   let event = error["event"] as? String,
+                   event == "challenge_invite" {
+                    let message = error["message"] as? String ?? "Unknown error"
+                    continuation.resume(throwing: OddSocketsError.serverError(message))
+                }
+                client.off("challenge_invite_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            client.once("challenge_invite_success", handler: successHandler!)
+            client.once("error", handler: errorHandler!)
+            client.emit("challenge_invite", data: params)
+        }
+    }
+
+    /// Reply to a directed challenge invite.
+    ///
+    /// - Parameters:
+    ///   - inviteId: The invite id from the `challenge_invited` broadcast.
+    ///   - accept: Whether the invite is accepted.
+    ///   - reason: Optional reason (e.g. for a decline).
+    public func replyChallengeInvite(
+        inviteId: String,
+        accept: Bool,
+        reason: String? = nil
+    ) async throws -> [String: Any] {
+        guard let client = client, client.isConnected else {
+            throw OddSocketsError.notConnected
+        }
+
+        var params: [String: Any] = [
+            "inviteId": inviteId,
+            "accept": accept
+        ]
+        if let reason = reason {
+            params["reason"] = reason
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var successHandler: ((Any) -> Void)?
+            var errorHandler: ((Any) -> Void)?
+
+            successHandler = { data in
+                if let result = data as? [String: Any] {
+                    continuation.resume(returning: result)
+                }
+                client.off("challenge_reply_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            errorHandler = { data in
+                if let error = data as? [String: Any],
+                   let event = error["event"] as? String,
+                   event == "challenge_reply" {
+                    let message = error["message"] as? String ?? "Unknown error"
+                    continuation.resume(throwing: OddSocketsError.serverError(message))
+                }
+                client.off("challenge_reply_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            client.once("challenge_reply_success", handler: successHandler!)
+            client.once("error", handler: errorHandler!)
+            client.emit("challenge_reply", data: params)
+        }
+    }
+
+    /// Cancel a directed challenge invite the current user sent.
+    ///
+    /// - Parameter inviteId: The invite id to cancel.
+    public func cancelChallengeInvite(inviteId: String) async throws -> [String: Any] {
+        guard let client = client, client.isConnected else {
+            throw OddSocketsError.notConnected
+        }
+
+        let params: [String: Any] = [
+            "inviteId": inviteId
+        ]
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var successHandler: ((Any) -> Void)?
+            var errorHandler: ((Any) -> Void)?
+
+            successHandler = { data in
+                if let result = data as? [String: Any] {
+                    continuation.resume(returning: result)
+                }
+                client.off("challenge_invite_cancel_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            errorHandler = { data in
+                if let error = data as? [String: Any],
+                   let event = error["event"] as? String,
+                   event == "challenge_invite_cancel" {
+                    let message = error["message"] as? String ?? "Unknown error"
+                    continuation.resume(throwing: OddSocketsError.serverError(message))
+                }
+                client.off("challenge_invite_cancel_success", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            client.once("challenge_invite_cancel_success", handler: successHandler!)
+            client.once("error", handler: errorHandler!)
+            client.emit("challenge_invite_cancel", data: params)
+        }
+    }
+
+    /// Query the current user's pending challenge invites.
+    public func getChallengeInvites() async throws -> [String: Any] {
+        guard let client = client, client.isConnected else {
+            throw OddSocketsError.notConnected
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var successHandler: ((Any) -> Void)?
+            var errorHandler: ((Any) -> Void)?
+
+            successHandler = { data in
+                if let result = data as? [String: Any] {
+                    continuation.resume(returning: result)
+                }
+                client.off("challenge_invites", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            errorHandler = { data in
+                if let error = data as? [String: Any],
+                   let event = error["event"] as? String,
+                   event == "challenge_invites_query" {
+                    let message = error["message"] as? String ?? "Unknown error"
+                    continuation.resume(throwing: OddSocketsError.serverError(message))
+                }
+                client.off("challenge_invites", handler: successHandler!)
+                client.off("error", handler: errorHandler!)
+            }
+
+            client.once("challenge_invites", handler: successHandler!)
+            client.once("error", handler: errorHandler!)
+            client.emit("challenge_invites_query", data: [String: Any]())
+        }
+    }
 }
