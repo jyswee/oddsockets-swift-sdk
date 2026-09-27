@@ -15,7 +15,7 @@
 //   broadcasts across the wire.
 //
 // Run:
-//   export ODDSOCKETS_API_KEY="ak_..."   # get a free key: see README
+//   export ODDSOCKETS_API_KEY="ak_..."   # get an API key: see README
 //   swift run
 //
 // Exit codes: 0 all green, 1 missing key / setup, 2 a scenario timed out.
@@ -45,7 +45,7 @@ enum Runner {
         guard let apiKey = ProcessInfo.processInfo.environment["ODDSOCKETS_API_KEY"],
               !apiKey.isEmpty else {
             FileHandle.standardError.write(Data(
-                "Missing ODDSOCKETS_API_KEY. Get a free key (see README), then:\n  export ODDSOCKETS_API_KEY=\"ak_...\"\n".utf8))
+                "Missing ODDSOCKETS_API_KEY. Get an API key (see README), then:\n  export ODDSOCKETS_API_KEY=\"ak_...\"\n".utf8))
             return 1
         }
 

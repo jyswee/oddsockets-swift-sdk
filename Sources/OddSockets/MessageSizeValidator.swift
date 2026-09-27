@@ -1,6 +1,6 @@
 import Foundation
 
-/// Message size limits (industry standard - matches PubNub)
+/// Platform message size limit, enforced server-side
 internal struct MessageSizeLimits {
     static let maxMessageSize = 32768 // 32KB in bytes
     static let maxMessageSizeKB = 32
@@ -30,7 +30,7 @@ internal struct MessageSizeValidator {
             let messageSizeKB = Double(messageSize) / 1024.0
             throw OddSocketsError.messageTooLarge(
                 "Message size (\(String(format: "%.0f", messageSizeKB))KB) exceeds maximum allowed size of \(MessageSizeLimits.maxMessageSizeKB)KB. " +
-                "This limit matches industry standards (PubNub, Socket.IO) for reliable real-time messaging."
+                "Split the payload, or publish a reference to it instead."
             )
         }
         

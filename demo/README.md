@@ -31,7 +31,7 @@ connection to a worker. Everything below crosses the wire between them.
 ## Run it
 
 ```bash
-export ODDSOCKETS_API_KEY="ak_..."   # get a free key: see the SDK README
+export ODDSOCKETS_API_KEY="ak_..."   # get an API key: see the SDK README
 swift run
 ```
 
