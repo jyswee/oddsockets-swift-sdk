@@ -18,6 +18,53 @@ public enum ConnectionState: String, CaseIterable, Codable {
     case failed = "failed"
 }
 
+/// Headline usage analytics for the account that owns the configured API key,
+/// as returned by `GET {managerUrl}/api/tenant/usage`.
+///
+/// HONESTY: each tile is nullable (`Int?`/`Double?`). Any tile the server cannot
+/// compute yet is preserved as `nil` — never coerced to 0 — so callers can
+/// distinguish "unknown" from a real zero.
+public struct UsageStats {
+    /// Monthly active users, or `nil` if the server could not compute it.
+    public let mau: Int?
+
+    /// Daily active users, or `nil` if the server could not compute it.
+    public let dau: Int?
+
+    /// Total messages, or `nil` if the server could not compute it.
+    public let totalMessages: Int?
+
+    /// Error rate, or `nil` if the server could not compute it.
+    public let errorRate: Double?
+
+    /// The owner scope the tiles are aggregated over.
+    public let ownerScope: String?
+
+    /// Optional additional detail returned by the server, or `nil`.
+    public let detail: [String: Any]?
+
+    /// The server-side timestamp for this snapshot.
+    public let timestamp: String?
+
+    public init(
+        mau: Int?,
+        dau: Int?,
+        totalMessages: Int?,
+        errorRate: Double?,
+        ownerScope: String?,
+        detail: [String: Any]?,
+        timestamp: String?
+    ) {
+        self.mau = mau
+        self.dau = dau
+        self.totalMessages = totalMessages
+        self.errorRate = errorRate
+        self.ownerScope = ownerScope
+        self.detail = detail
+        self.timestamp = timestamp
+    }
+}
+
 /// Represents different event types emitted by the OddSockets client.
 public enum EventType: String, CaseIterable, Codable {
     /// Emitted when the client connects.

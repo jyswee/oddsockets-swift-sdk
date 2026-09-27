@@ -332,8 +332,79 @@ public final class OddSocketsClient: ObservableObject {
         return results
     }
     
+    // MARK: - Usage Analytics
+
+    /// Fetches this tenant's headline usage tiles (MAU / DAU / total messages /
+    /// error-rate) for the account that owns the configured API key.
+    ///
+    /// Server contract: `GET {managerUrl}/api/tenant/usage` with the `X-API-Key`
+    /// header. Requires an API key — keyless/token-only clients have no owner key
+    /// to scope by, so this throws for them.
+    ///
+    /// HONESTY: any tile the server cannot compute yet comes back as null. This
+    /// method preserves null verbatim (`Int?`/`Double?`, never coerced to 0) so
+    /// callers can render an em-dash instead of a fabricated zero.
+    /// - Returns: The usage statistics for the owning account.
+    /// - Throws: `OddSocketsError` if the client is in token/keyless mode with no
+    ///   API key, or if the request fails.
+    public func getUsageStats() async throws -> UsageStats {
+        guard !isTokenMode, !config.apiKey.isEmpty else {
+            throw OddSocketsError.invalidConfiguration(
+                "getUsageStats requires an apiKey (keyless/token clients have no owner scope to query)")
+        }
+
+        // Discover the manager exactly as the select-worker call does.
+        let managerUrl = try ManagerDiscovery(configuredUrl: config.managerUrl).discoverManagerUrl()
+
+        guard let requestUrl = URL(string: "\(managerUrl)/api/tenant/usage") else {
+            throw OddSocketsError.invalidConfiguration("Invalid managerUrl: \(managerUrl)")
+        }
+
+        var request = URLRequest(url: requestUrl)
+        request.httpMethod = "GET"
+        request.setValue(config.apiKey, forHTTPHeaderField: "X-API-Key")
+        request.setValue("OddSockets-Swift-SDK/0.1.0-beta.1", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 10
+
+        let (data, response) = try await urlSession.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OddSocketsError.networkError("Invalid response type")
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw OddSocketsError.networkError("Usage stats request failed with status \(httpResponse.statusCode)")
+        }
+
+        let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let tiles = root["tiles"] as? [String: Any] ?? [:]
+
+        // `as? Int` / `as? Double` yield nil for an absent key or a JSON null, so
+        // a null tile stays distinguishable from a real 0.
+        return UsageStats(
+            mau: Self.numberAsInt(tiles["mau"]),
+            dau: Self.numberAsInt(tiles["dau"]),
+            totalMessages: Self.numberAsInt(tiles["totalMessages"]),
+            errorRate: Self.numberAsDouble(tiles["errorRate"]),
+            ownerScope: root["ownerScope"] as? String,
+            detail: root["detail"] as? [String: Any],
+            timestamp: root["timestamp"] as? String
+        )
+    }
+
+    /// Coerces a JSON number tile to `Int`, preserving nil for absent/null tiles.
+    private static func numberAsInt(_ value: Any?) -> Int? {
+        if let n = value as? NSNumber, !(value is NSNull) { return n.intValue }
+        return nil
+    }
+
+    /// Coerces a JSON number tile to `Double`, preserving nil for absent/null tiles.
+    private static func numberAsDouble(_ value: Any?) -> Double? {
+        if let n = value as? NSNumber, !(value is NSNull) { return n.doubleValue }
+        return nil
+    }
+
     // MARK: - Event Handling
-    
+
     /// Adds an event handler.
     /// - Parameters:
     ///   - eventType: The event type
