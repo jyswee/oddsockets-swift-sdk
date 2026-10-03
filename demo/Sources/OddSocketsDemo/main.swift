@@ -55,7 +55,6 @@ enum Runner {
         do {
             let alice = try await connect(apiKey: apiKey, userId: "alice")
             let bob = try await connect(apiKey: apiKey, userId: "bob")
-            print("[connect] alice -> \(alice.workerInfo.workerId ?? "?"), bob -> \(bob.workerInfo.workerId ?? "?")")
 
             let core = try await scenarioCore(alice: alice, bob: bob, nonce: nonce, flags: flags)
             if !core { return 2 }

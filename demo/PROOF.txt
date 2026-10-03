@@ -1,10 +1,7 @@
-warning: 'starscream': found 1 file(s) which are unhandled; explicitly declare them as resources or exclude from the target
-    /Users/dev/src/oddsockets-swift-sdk/demo/.build/checkouts/Starscream/Sources/Info.plist
 [0/1] Planning build
 Building for debugging...
 [0/3] Write swift-version--58304C5D6DBC2206.txt
 Build of product 'OddSocketsDemo' complete! (0.31s)
-[connect] alice -> [instance], bob -> [instance]
 
 === Scenario 1: core pub/sub on demo-core-5c0668e14434674e ===
 [alice] subscribed
